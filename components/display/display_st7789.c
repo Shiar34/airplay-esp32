@@ -37,6 +37,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "tjpgd.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -60,6 +61,11 @@ static const char *TAG = "display_st7789";
 // Background image path on SPIFFS
 #define BG_SPIFFS_PATH   "/spiffs/bg/background.bin"
 #define BG_EXPECTED_SIZE ((long)DISPLAY_WIDTH * DISPLAY_HEIGHT * 2) // RGB565
+#define ARTWORK_MAX_BYTES (256 * 1024)
+#define ARTWORK_MAX_DIMENSION 4096
+#define ARTWORK_MAX_PIXELS (4UL * 1024 * 1024)
+#define ARTWORK_SIZE 88
+#define ARTWORK_TEXT_GAP 16
 
 // ============================================================================
 // Layout constants
@@ -96,6 +102,9 @@ static struct {
   display_state_t state;
   volatile bool dirty;  // written by RTSP callback, polled by display_task
   int64_t sync_time_us; // 64-bit — torn reads would cause position jumps
+  uint8_t *pending_artwork;
+  size_t pending_artwork_len;
+  bool artwork_dirty;
 } s_display;
 
 // Protects s_display against concurrent access from the RTSP event callback
@@ -115,10 +124,13 @@ static lv_display_t *s_lvgl_disp = NULL;
 
 static uint8_t *s_bg_buf = NULL;
 static lv_image_dsc_t s_bg_dsc;
+static uint8_t *s_artwork_buf = NULL;
+static lv_image_dsc_t s_artwork_dsc;
 
 static lv_obj_t *s_label_title = NULL;
 static lv_obj_t *s_label_artist = NULL;
 static lv_obj_t *s_label_album = NULL;
+static lv_obj_t *s_image_artwork = NULL;
 static lv_obj_t *s_label_muted = NULL;
 static lv_obj_t *s_label_status = NULL;
 static lv_obj_t *s_bar_progress = NULL;
@@ -126,6 +138,162 @@ static lv_obj_t *s_label_time_elapsed = NULL;
 static lv_obj_t *s_label_time_remaining = NULL;
 static lv_obj_t *s_label_battery = NULL;
 static lv_obj_t *s_label_volume = NULL;
+
+typedef struct {
+  const uint8_t *input;
+  size_t input_len;
+  size_t input_offset;
+  uint16_t *pixels;
+  uint16_t source_width;
+  uint16_t source_height;
+} artwork_decode_context_t;
+
+static size_t artwork_jpeg_read(JDEC *decoder, uint8_t *buffer, size_t size) {
+  artwork_decode_context_t *context = decoder->device;
+  if (context->input_offset > context->input_len) {
+    return 0;
+  }
+
+  size_t available = context->input_len - context->input_offset;
+  size_t count = (size < available) ? size : available;
+  if (buffer && count > 0) {
+    memcpy(buffer, context->input + context->input_offset, count);
+  }
+  context->input_offset += count;
+  return count;
+}
+
+static int artwork_jpeg_output(JDEC *decoder, void *bitmap, JRECT *rect) {
+  artwork_decode_context_t *context = decoder->device;
+  const uint8_t *mcu = bitmap;
+  uint32_t rect_width = rect->right - rect->left + 1;
+  uint32_t rect_height = rect->bottom - rect->top + 1;
+
+  for (uint32_t row = 0; row < rect_height; row++) {
+    uint32_t source_y = rect->top + row;
+    uint32_t target_y0 = source_y * ARTWORK_SIZE / context->source_height;
+    uint32_t target_y1 = ((source_y + 1) * ARTWORK_SIZE +
+                          context->source_height - 1) /
+                         context->source_height;
+    for (uint32_t column = 0; column < rect_width; column++) {
+      uint32_t source_x = rect->left + column;
+      uint32_t target_x0 = source_x * ARTWORK_SIZE / context->source_width;
+      uint32_t target_x1 = ((source_x + 1) * ARTWORK_SIZE +
+                            context->source_width - 1) /
+                           context->source_width;
+      size_t source_offset = ((size_t)row * rect_width + column) * 3;
+      uint8_t blue = mcu[source_offset];
+      uint8_t green = mcu[source_offset + 1];
+      uint8_t red = mcu[source_offset + 2];
+      uint16_t color = ((uint16_t)(red & 0xf8) << 8) |
+                       ((uint16_t)(green & 0xfc) << 3) | (blue >> 3);
+
+      for (uint32_t target_y = target_y0; target_y < target_y1; target_y++) {
+        for (uint32_t target_x = target_x0; target_x < target_x1; target_x++) {
+          context->pixels[target_y * ARTWORK_SIZE + target_x] = color;
+        }
+      }
+    }
+  }
+  return 1;
+}
+
+static uint8_t *artwork_decode_thumbnail(const uint8_t *jpeg, size_t jpeg_len) {
+  uint16_t *pixels = heap_caps_calloc(ARTWORK_SIZE * ARTWORK_SIZE,
+                                      sizeof(*pixels), MALLOC_CAP_SPIRAM);
+  JDEC *decoder = heap_caps_calloc(1, sizeof(*decoder), MALLOC_CAP_INTERNAL);
+  uint8_t *work_buffer = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
+  if (!pixels || !decoder || !work_buffer) {
+    heap_caps_free(pixels);
+    heap_caps_free(decoder);
+    heap_caps_free(work_buffer);
+    return NULL;
+  }
+
+  artwork_decode_context_t context = {
+      .input = jpeg,
+      .input_len = jpeg_len,
+      .pixels = pixels,
+  };
+  JRESULT result =
+      jd_prepare(decoder, artwork_jpeg_read, work_buffer, 4096, &context);
+  if (result == JDR_OK && decoder->width > 0 && decoder->height > 0 &&
+      decoder->width <= ARTWORK_MAX_DIMENSION &&
+      decoder->height <= ARTWORK_MAX_DIMENSION &&
+      (uint32_t)decoder->width * decoder->height <= ARTWORK_MAX_PIXELS) {
+    context.source_width = decoder->width;
+    context.source_height = decoder->height;
+    result = jd_decomp(decoder, artwork_jpeg_output, 0);
+  } else {
+    result = JDR_PAR;
+  }
+
+  heap_caps_free(decoder);
+  heap_caps_free(work_buffer);
+  if (result != JDR_OK) {
+    heap_caps_free(pixels);
+    return NULL;
+  }
+  return (uint8_t *)pixels;
+}
+
+static bool jpeg_get_dimensions(const uint8_t *data, size_t len,
+                                uint16_t *width, uint16_t *height) {
+  if (!data || len < 4 || data[0] != 0xff || data[1] != 0xd8) {
+    return false;
+  }
+
+  size_t pos = 2;
+  while (pos + 1 < len) {
+    if (data[pos++] != 0xff) {
+      continue;
+    }
+    while (pos < len && data[pos] == 0xff) {
+      pos++;
+    }
+    if (pos >= len) {
+      return false;
+    }
+
+    uint8_t marker = data[pos++];
+    if (marker == 0xd9 || marker == 0xda) {
+      return false;
+    }
+    if (marker == 0xd8 || marker == 0x01 ||
+        (marker >= 0xd0 && marker <= 0xd7)) {
+      continue;
+    }
+    if (pos + 2 > len) {
+      return false;
+    }
+
+    size_t segment_len = ((size_t)data[pos] << 8) | data[pos + 1];
+    if (segment_len < 2 || segment_len > len - pos) {
+      return false;
+    }
+
+    bool is_sof = (marker >= 0xc0 && marker <= 0xc3) ||
+                  (marker >= 0xc5 && marker <= 0xc7) ||
+                  (marker >= 0xc9 && marker <= 0xcb) ||
+                  (marker >= 0xcd && marker <= 0xcf);
+    if (is_sof && segment_len >= 7) {
+      uint16_t image_height = ((uint16_t)data[pos + 3] << 8) | data[pos + 4];
+      uint16_t image_width = ((uint16_t)data[pos + 5] << 8) | data[pos + 6];
+      if (image_width == 0 || image_height == 0 ||
+          image_width > ARTWORK_MAX_DIMENSION ||
+          image_height > ARTWORK_MAX_DIMENSION ||
+          (uint32_t)image_width * image_height > ARTWORK_MAX_PIXELS) {
+        return false;
+      }
+      *width = image_width;
+      *height = image_height;
+      return true;
+    }
+
+    pos += segment_len;
+  }
+  return false;
+}
 
 // ============================================================================
 // Background loading
@@ -226,6 +394,12 @@ static void ui_create(void) {
     lv_obj_align(bg, LV_ALIGN_TOP_LEFT, 0, 0);
   }
 
+  s_image_artwork = lv_image_create(scr);
+  lv_obj_set_size(s_image_artwork, ARTWORK_SIZE, ARTWORK_SIZE);
+  lv_image_set_inner_align(s_image_artwork, LV_IMAGE_ALIGN_CENTER);
+  lv_obj_align(s_image_artwork, LV_ALIGN_TOP_RIGHT, X_MARGIN_R, Y_TITLE);
+  lv_obj_set_hidden(s_image_artwork, true);
+
   // Muted indicator — top-right corner, red, hidden by default
   s_label_muted = lv_label_create(scr);
   lv_obj_set_style_text_font(s_label_muted, &lv_font_montserrat_14, 0);
@@ -240,7 +414,9 @@ static void ui_create(void) {
   const lv_font_t *artist_font =
       (DISPLAY_HEIGHT >= 220) ? &lv_font_montserrat_14 : &lv_font_montserrat_16;
   s_label_title = lv_label_create(scr);
-  lv_obj_set_width(s_label_title, DISPLAY_WIDTH - (X_MARGIN * 2));
+  lv_obj_set_width(s_label_title,
+                   DISPLAY_WIDTH - (X_MARGIN * 2) - ARTWORK_SIZE -
+                       ARTWORK_TEXT_GAP);
   lv_label_set_long_mode(s_label_title, LV_LABEL_LONG_SCROLL_CIRCULAR);
   lv_obj_set_style_text_font(s_label_title, title_font, 0);
   lv_obj_set_style_text_color(s_label_title, lv_color_white(), 0);
@@ -249,7 +425,9 @@ static void ui_create(void) {
 
   // Artist — medium font, light grey, scrolling
   s_label_artist = lv_label_create(scr);
-  lv_obj_set_width(s_label_artist, DISPLAY_WIDTH - (X_MARGIN * 2));
+  lv_obj_set_width(s_label_artist,
+                   DISPLAY_WIDTH - (X_MARGIN * 2) - ARTWORK_SIZE -
+                       ARTWORK_TEXT_GAP);
   lv_label_set_long_mode(s_label_artist, LV_LABEL_LONG_SCROLL_CIRCULAR);
   lv_obj_set_style_text_font(s_label_artist, artist_font, 0);
   lv_obj_set_style_text_color(s_label_artist, lv_color_make(180, 180, 180), 0);
@@ -258,7 +436,9 @@ static void ui_create(void) {
 
   // Album — small font, dimmer grey, scrolling
   s_label_album = lv_label_create(scr);
-  lv_obj_set_width(s_label_album, DISPLAY_WIDTH - (X_MARGIN * 2) - 60);
+  lv_obj_set_width(s_label_album,
+                   DISPLAY_WIDTH - (X_MARGIN * 2) - ARTWORK_SIZE -
+                       ARTWORK_TEXT_GAP - 40);
   lv_label_set_long_mode(s_label_album, LV_LABEL_LONG_SCROLL_CIRCULAR);
   lv_obj_set_style_text_font(s_label_album, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(s_label_album, lv_color_make(140, 140, 140), 0);
@@ -386,6 +566,9 @@ static void ui_update(void) {
   uint32_t position_secs;
   int64_t sync_time_us;
   display_state_t state;
+  uint8_t *pending_artwork = NULL;
+  size_t pending_artwork_len = 0;
+  bool artwork_update = false;
 
   STATE_LOCK();
   memcpy(title, s_display.title, sizeof(title));
@@ -408,6 +591,50 @@ static void ui_update(void) {
     ESP_LOGW(TAG, "ui_update: lock timeout");
     return;
   }
+
+  STATE_LOCK();
+  if (s_display.artwork_dirty) {
+    artwork_update = true;
+    pending_artwork = s_display.pending_artwork;
+    pending_artwork_len = s_display.pending_artwork_len;
+    s_display.pending_artwork = NULL;
+    s_display.pending_artwork_len = 0;
+    s_display.artwork_dirty = false;
+  }
+  STATE_UNLOCK();
+
+  uint8_t *old_artwork = NULL;
+  if (artwork_update) {
+    old_artwork = s_artwork_buf;
+    s_artwork_buf = pending_artwork
+                        ? artwork_decode_thumbnail(pending_artwork,
+                                                   pending_artwork_len)
+                        : NULL;
+    heap_caps_free(pending_artwork);
+    if (s_artwork_buf) {
+      memset(&s_artwork_dsc, 0, sizeof(s_artwork_dsc));
+      s_artwork_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+      s_artwork_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+      s_artwork_dsc.header.w = ARTWORK_SIZE;
+      s_artwork_dsc.header.h = ARTWORK_SIZE;
+      s_artwork_dsc.data_size = ARTWORK_SIZE * ARTWORK_SIZE * sizeof(uint16_t);
+      s_artwork_dsc.data = s_artwork_buf;
+      lv_image_set_src(s_image_artwork, &s_artwork_dsc);
+      lv_obj_set_size(s_image_artwork, ARTWORK_SIZE, ARTWORK_SIZE);
+      lv_obj_set_hidden(s_image_artwork, false);
+    } else {
+      lv_image_set_src(s_image_artwork, NULL);
+      lv_obj_set_hidden(s_image_artwork, true);
+    }
+  }
+
+  int32_t text_width = DISPLAY_WIDTH - (X_MARGIN * 2);
+  if (s_artwork_buf) {
+    text_width -= ARTWORK_SIZE + ARTWORK_TEXT_GAP;
+  }
+  lv_obj_set_width(s_label_title, text_width);
+  lv_obj_set_width(s_label_artist, text_width);
+  lv_obj_set_width(s_label_album, text_width - 40);
 
   switch (state) {
   case DISPLAY_STATE_STANDBY:
@@ -481,6 +708,7 @@ static void ui_update(void) {
   ui_update_status_row();
 
   lvgl_port_unlock();
+  heap_caps_free(old_artwork);
 }
 
 // ============================================================================
@@ -496,10 +724,38 @@ static void on_playback_event(playback_source_t source, playback_event_t event,
   // All mutations of s_display happen under the state mutex so reads in
   // display_task see a consistent snapshot. The callback runs in the RTSP
   // event thread (not an ISR), so blocking on a FreeRTOS mutex is safe.
+  uint8_t *incoming_artwork = NULL;
+  uint16_t incoming_width = 0;
+  uint16_t incoming_height = 0;
+  if (event == PLAYBACK_EVENT_METADATA && data && data->artwork_data) {
+    if (!data->artwork_is_jpeg) {
+      ESP_LOGW(TAG, "Ignoring non-JPEG AirPlay artwork (%zu bytes)",
+               data->artwork_len);
+    } else if (data->artwork_len > ARTWORK_MAX_BYTES ||
+               !jpeg_get_dimensions(data->artwork_data, data->artwork_len,
+                                    &incoming_width, &incoming_height)) {
+      ESP_LOGW(TAG, "Ignoring invalid or oversized AirPlay JPEG (%zu bytes)",
+               data->artwork_len);
+    } else {
+      incoming_artwork =
+          heap_caps_malloc(data->artwork_len, MALLOC_CAP_SPIRAM);
+      if (incoming_artwork) {
+        memcpy(incoming_artwork, data->artwork_data, data->artwork_len);
+      } else {
+        ESP_LOGW(TAG, "No PSRAM available for AirPlay artwork");
+      }
+    }
+  }
+
+  uint8_t *discard_artwork = NULL;
   STATE_LOCK();
 
   switch (event) {
   case PLAYBACK_EVENT_CONNECTED:
+    discard_artwork = s_display.pending_artwork;
+    s_display.pending_artwork = NULL;
+    s_display.pending_artwork_len = 0;
+    s_display.artwork_dirty = true;
     s_display.state = DISPLAY_STATE_CONNECTED;
     memset(s_display.title, 0, sizeof(s_display.title));
     memset(s_display.artist, 0, sizeof(s_display.artist));
@@ -524,6 +780,10 @@ static void on_playback_event(playback_source_t source, playback_event_t event,
     break;
 
   case PLAYBACK_EVENT_DISCONNECTED:
+    discard_artwork = s_display.pending_artwork;
+    s_display.pending_artwork = NULL;
+    s_display.pending_artwork_len = 0;
+    s_display.artwork_dirty = true;
     s_display.state = DISPLAY_STATE_STANDBY;
     memset(s_display.title, 0, sizeof(s_display.title));
     memset(s_display.artist, 0, sizeof(s_display.artist));
@@ -538,6 +798,13 @@ static void on_playback_event(playback_source_t source, playback_event_t event,
     if (data) {
       bool track_changed = data->metadata.title[0] &&
                            strcmp(data->metadata.title, s_display.title) != 0;
+
+      if (track_changed) {
+        discard_artwork = s_display.pending_artwork;
+        s_display.pending_artwork = NULL;
+        s_display.pending_artwork_len = 0;
+        s_display.artwork_dirty = true;
+      }
 
       if (data->metadata.title[0]) {
         memcpy(s_display.title, data->metadata.title, METADATA_STRING_MAX);
@@ -560,6 +827,16 @@ static void on_playback_event(playback_source_t source, playback_event_t event,
         s_display.position_secs = data->metadata.position_secs;
       }
 
+      if (incoming_artwork) {
+        if (!discard_artwork) {
+          discard_artwork = s_display.pending_artwork;
+        }
+        s_display.pending_artwork = incoming_artwork;
+        s_display.pending_artwork_len = data->artwork_len;
+        s_display.artwork_dirty = true;
+        incoming_artwork = NULL;
+      }
+
       s_display.sync_time_us = esp_timer_get_time();
       s_display.dirty = true;
     }
@@ -567,6 +844,8 @@ static void on_playback_event(playback_source_t source, playback_event_t event,
   }
 
   STATE_UNLOCK();
+  heap_caps_free(discard_artwork);
+  heap_caps_free(incoming_artwork);
 }
 
 // ============================================================================

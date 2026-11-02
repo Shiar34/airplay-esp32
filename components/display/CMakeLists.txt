@@ -18,8 +18,11 @@ idf_component_register(
 
 if(CONFIG_DISPLAY_ENABLED)
     if(CONFIG_DISPLAY_DRIVER_ST7789)
+        idf_component_get_property(lvgl_component_dir lvgl__lvgl COMPONENT_DIR)
         target_sources(${COMPONENT_LIB} PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/display_st7789.c")
+        target_include_directories(${COMPONENT_LIB} PRIVATE
+            "${lvgl_component_dir}/src/libs/tjpgd")
         target_link_libraries(${COMPONENT_LIB} PRIVATE
             idf::esp_lcd
             idf::driver

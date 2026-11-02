@@ -10,6 +10,9 @@ Album cover art is **disabled by default**. Most receivers have no screen, or on
 OLED, and pulling artwork over the RTSP connection can stall the audio pipeline and cause
 drop-outs — especially on unbuffered AirPlay 1 / realtime streams.
 
+When enabled on the Amped-Esparagus-Plus-S3, JPEG cover art is displayed on its ST7789 TFT.
+PNG artwork may be received but is not currently rendered.
+
 When disabled, the receiver drops artwork type `1` from its advertised `md` txt record so
 senders do not transmit cover art at all, and ignores any that arrives anyway. Track title,
 artist, album and progress metadata are always received.

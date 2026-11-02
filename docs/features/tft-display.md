@@ -99,8 +99,10 @@ the driver — see the colour bar test in the
 
 ## Cover art
 
-Album artwork is disabled by default because it can stall the audio pipeline. If you have
-a TFT display and want it, see [AirPlay tuning](airplay-tuning.md#cover-art).
+Album artwork is disabled by default because it can stall the audio pipeline. With
+`CONFIG_ENABLE_AIRPLAY_ARTWORK=y`, JPEG covers appear as a thumbnail in the upper-right
+of the Amped-Esparagus-Plus-S3 ST7789 display. PNG artwork is not currently rendered. See
+[AirPlay tuning](airplay-tuning.md#cover-art) for the setting and trade-offs.
 
 ## Implementation notes
 

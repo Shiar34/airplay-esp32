@@ -60,11 +60,15 @@ typedef struct {
 } playback_metadata_t;
 
 // ============================================================================
-// Event Data Union
+// Event Data
 // ============================================================================
 
-typedef union {
+typedef struct {
   playback_metadata_t metadata; // Valid when event == PLAYBACK_EVENT_METADATA
+  // Borrowed from the RTSP request; valid only during synchronous callbacks.
+  const uint8_t *artwork_data;
+  size_t artwork_len;
+  bool artwork_is_jpeg;
 } playback_event_data_t;
 
 /**
