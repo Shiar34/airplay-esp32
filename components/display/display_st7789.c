@@ -736,7 +736,7 @@ void display_init(void *bus) {
   // Rotation MUST be applied after lvgl_port_add_disp() — the port resets
   // the ST7789 MADCTL register during display registration.
   ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel_handle, true));
-  ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, true, false));
+  ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, false, true));
   ESP_ERROR_CHECK(esp_lcd_panel_set_gap(
       panel_handle, CONFIG_DISPLAY_ST7789_GAP_X, CONFIG_DISPLAY_ST7789_GAP_Y));
 
