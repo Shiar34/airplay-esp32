@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -35,6 +36,9 @@ static const char *TAG = "ptp_clock";
 #define PTP_HEADER_SIZE      34
 #define PTP_TIMESTAMP_OFFSET 34
 #define PTP_TIMESTAMP_SIZE   10
+#define PTP_DELAY_REQ_SIZE   (PTP_HEADER_SIZE + PTP_TIMESTAMP_SIZE)
+#define PTP_DELAY_RESP_SIZE  (PTP_HEADER_SIZE + PTP_TIMESTAMP_SIZE + 10)
+#define PTP_DELAY_REQ_INTERVAL_MS 1000
 
 // Synchronization parameters
 //
@@ -129,6 +133,15 @@ static struct {
   uint32_t rejected_master_count; // SYNC/FOLLOW_UP from a non-matching master
   uint32_t outlier_count;         // samples rejected by 50ms threshold
   uint32_t consecutive_outliers;
+  uint8_t local_port_identity[10];
+  struct sockaddr_in master_addr;
+  uint64_t master_addr_clock_id;
+  uint16_t delay_req_seq;
+  uint16_t pending_delay_req_seq;
+  uint64_t pending_delay_req_clock_id;
+  uint32_t pending_delay_req_ms;
+  uint32_t delay_req_count;
+  uint32_t delay_resp_count;
   spiram_task_mem_t task_mem;
 
   // Two-step sync tracking
@@ -143,6 +156,8 @@ static struct {
   // master is checked against the samples again.
   bool session_ended;
   uint8_t last_sync_source_port_identity[10];
+  bool master_addr_valid;
+  bool delay_req_pending;
 } ptp = {0};
 
 // PTP packets and RTSP session changes run on different tasks (and cores).
@@ -202,16 +217,114 @@ static uint64_t parse_ptp_timestamp_ns(const uint8_t *data) {
   return seconds * 1000000000ULL + nanos;
 }
 
+static size_t build_delay_req_packet(uint8_t *packet, size_t capacity,
+                                     uint16_t sequence_id,
+                                     const uint8_t port_identity[10],
+                                     int64_t timestamp_ns) {
+  if (capacity < PTP_DELAY_REQ_SIZE || timestamp_ns < 0) {
+    return 0;
+  }
+
+  memset(packet, 0, PTP_DELAY_REQ_SIZE);
+  packet[0] = 0x10 | PTP_MSG_DELAY_REQ;
+  packet[1] = 2;
+  packet[2] = 0;
+  packet[3] = PTP_DELAY_REQ_SIZE;
+  packet[6] = 0x04; // unicast and PTP timescale
+  packet[7] = 0x08;
+  memcpy(packet + 20, port_identity, 10);
+  packet[30] = (uint8_t)(sequence_id >> 8);
+  packet[31] = (uint8_t)sequence_id;
+
+  uint64_t seconds = (uint64_t)timestamp_ns / 1000000000ULL;
+  uint32_t nanos = (uint32_t)((uint64_t)timestamp_ns % 1000000000ULL);
+  for (int i = 0; i < 6; i++) {
+    packet[PTP_TIMESTAMP_OFFSET + i] =
+        (uint8_t)(seconds >> (40 - 8 * i));
+  }
+  packet[PTP_TIMESTAMP_OFFSET + 6] = (uint8_t)(nanos >> 24);
+  packet[PTP_TIMESTAMP_OFFSET + 7] = (uint8_t)(nanos >> 16);
+  packet[PTP_TIMESTAMP_OFFSET + 8] = (uint8_t)(nanos >> 8);
+  packet[PTP_TIMESTAMP_OFFSET + 9] = (uint8_t)nanos;
+  return PTP_DELAY_REQ_SIZE;
+}
+
 // Get local time in nanoseconds (from esp_timer)
 static inline int64_t get_local_time_ns(void) {
   return (int64_t)esp_timer_get_time() * 1000LL;
 }
 
+static void send_delay_request(void) {
+  uint8_t packet[PTP_DELAY_REQ_SIZE];
+  uint8_t port_identity[10];
+  struct sockaddr_in destination;
+  uint16_t sequence_id;
+  int64_t transmit_time_ns = get_local_time_ns();
+  uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+  portENTER_CRITICAL(&ptp_state_mux);
+  if (ptp.event_socket < 0 || !ptp.master_addr_valid ||
+      (ptp.expected_clock_id != 0 &&
+       ptp.master_addr_clock_id != ptp.expected_clock_id) ||
+      (ptp.delay_req_pending &&
+       now_ms - ptp.pending_delay_req_ms < PTP_DELAY_REQ_INTERVAL_MS)) {
+    portEXIT_CRITICAL(&ptp_state_mux);
+    return;
+  }
+
+  destination = ptp.master_addr;
+  memcpy(port_identity, ptp.local_port_identity, sizeof(port_identity));
+  sequence_id = ptp.delay_req_seq++;
+  ptp.pending_delay_req_seq = sequence_id;
+  ptp.pending_delay_req_clock_id = ptp.master_addr_clock_id;
+  ptp.pending_delay_req_ms = now_ms;
+  ptp.delay_req_pending = true;
+  portEXIT_CRITICAL(&ptp_state_mux);
+
+  size_t packet_len = build_delay_req_packet(
+      packet, sizeof(packet), sequence_id, port_identity, transmit_time_ns);
+  ssize_t sent = sendto(ptp.event_socket, packet, packet_len, 0,
+                        (struct sockaddr *)&destination, sizeof(destination));
+  portENTER_CRITICAL(&ptp_state_mux);
+  if (sent == (ssize_t)packet_len) {
+    ptp.delay_req_count++;
+  } else if (ptp.delay_req_pending &&
+             ptp.pending_delay_req_seq == sequence_id) {
+    ptp.delay_req_pending = false;
+  }
+  portEXIT_CRITICAL(&ptp_state_mux);
+}
+
+static void process_delay_resp(const uint8_t *data, size_t len,
+                               const struct sockaddr_in *source) {
+  if (len < PTP_DELAY_RESP_SIZE || data[1] != 2 || data[4] != 0) {
+    return;
+  }
+
+  uint16_t sequence_id = ((uint16_t)data[30] << 8) | data[31];
+  uint64_t source_clock_id = parse_ptp_clock_id(data);
+  portENTER_CRITICAL(&ptp_state_mux);
+  bool matches = ptp.delay_req_pending &&
+                 sequence_id == ptp.pending_delay_req_seq &&
+                 source_clock_id == ptp.pending_delay_req_clock_id &&
+                 (ptp.expected_clock_id == 0 ||
+                  source_clock_id == ptp.expected_clock_id) &&
+                 memcmp(data + PTP_HEADER_SIZE + PTP_TIMESTAMP_SIZE,
+                        ptp.local_port_identity,
+                        sizeof(ptp.local_port_identity)) == 0 &&
+                 source->sin_addr.s_addr == ptp.master_addr.sin_addr.s_addr;
+  if (matches) {
+    ptp.delay_req_pending = false;
+    ptp.delay_resp_count++;
+  }
+  portEXIT_CRITICAL(&ptp_state_mux);
+}
+
 // Update offset with new sample using asymmetric smoothing (nqptp-style).
 //
-// The key insight from nqptp: since we are a passive PTP listener (no
-// DELAY_REQ/DELAY_RESP), every measured offset contains a one-way network
-// delay bias:  offset_measured = true_offset - delay.
+// Delay_Req/Delay_Resp probes satisfy the AirPlay server's PTP exchange but
+// do not feed this filter. Each Sync sample still contains a one-way delay
+// bias: offset_measured = true_offset - delay.
 // LARGER offsets come from SHORTER delays and are MORE accurate.
 //
 // By accepting positive jitter (larger offset = shorter delay) quickly and
@@ -426,8 +539,9 @@ static void process_followup(const uint8_t *data, size_t len, uint16_t seq,
 }
 
 // Process received PTP message
-static void process_ptp_message(const uint8_t *data, size_t len,
-                                bool is_event_port) {
+static void process_ptp_message_from(const uint8_t *data, size_t len,
+                                     bool is_event_port,
+                                     const struct sockaddr_in *source) {
   if (len < PTP_HEADER_SIZE) {
     return;
   }
@@ -453,6 +567,12 @@ static void process_ptp_message(const uint8_t *data, size_t len,
   switch (msg_type) {
   case PTP_MSG_SYNC:
     if (is_event_port) {
+      if (source) {
+        ptp.master_addr = *source;
+        ptp.master_addr.sin_port = htons(PTP_EVENT_PORT);
+        ptp.master_addr_clock_id = parse_ptp_clock_id(data);
+        ptp.master_addr_valid = true;
+      }
       process_sync(data, len, seq, &log);
     }
     break;
@@ -468,11 +588,24 @@ static void process_ptp_message(const uint8_t *data, size_t len,
     // Could track master identity here if needed
     break;
 
+  case PTP_MSG_DELAY_RESP:
+    if (!is_event_port && source) {
+      portEXIT_CRITICAL(&ptp_state_mux);
+      process_delay_resp(data, len, source);
+      return;
+    }
+    break;
+
   default:
     break;
   }
   portEXIT_CRITICAL(&ptp_state_mux);
   log_offset_update(&log);
+}
+
+static void process_ptp_message(const uint8_t *data, size_t len,
+                                bool is_event_port) {
+  process_ptp_message_from(data, len, is_event_port, NULL);
 }
 
 // Create and bind multicast socket
@@ -521,6 +654,7 @@ static int create_ptp_socket(uint16_t port) {
 // PTP task - listens for messages on both ports
 static void ptp_task(void *pvParameters) {
   uint8_t buffer[256];
+  uint32_t last_delay_req_ms = 0;
 
   while (ptp.running) {
     fd_set read_fds;
@@ -563,19 +697,31 @@ static void ptp_task(void *pvParameters) {
     } else {
       // Check event port (SYNC messages)
       if (ptp.event_socket >= 0 && FD_ISSET(ptp.event_socket, &read_fds)) {
-        ssize_t len = recv(ptp.event_socket, buffer, sizeof(buffer), 0);
+        struct sockaddr_in source = {0};
+        socklen_t source_len = sizeof(source);
+        ssize_t len = recvfrom(ptp.event_socket, buffer, sizeof(buffer), 0,
+                               (struct sockaddr *)&source, &source_len);
         if (len > 0) {
-          process_ptp_message(buffer, (size_t)len, true);
+          process_ptp_message_from(buffer, (size_t)len, true, &source);
         }
       }
 
       // Check general port (FOLLOW_UP messages)
       if (ptp.general_socket >= 0 && FD_ISSET(ptp.general_socket, &read_fds)) {
-        ssize_t len = recv(ptp.general_socket, buffer, sizeof(buffer), 0);
+        struct sockaddr_in source = {0};
+        socklen_t source_len = sizeof(source);
+        ssize_t len = recvfrom(ptp.general_socket, buffer, sizeof(buffer), 0,
+                               (struct sockaddr *)&source, &source_len);
         if (len > 0) {
-          process_ptp_message(buffer, (size_t)len, false);
+          process_ptp_message_from(buffer, (size_t)len, false, &source);
         }
       }
+    }
+
+    uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    if (now_ms - last_delay_req_ms >= PTP_DELAY_REQ_INTERVAL_MS) {
+      send_delay_request();
+      last_delay_req_ms = now_ms;
     }
   }
 
@@ -603,6 +749,20 @@ esp_err_t ptp_clock_init(void) {
   portEXIT_CRITICAL(&ptp_state_mux);
   ptp.event_socket = -1;
   ptp.general_socket = -1;
+
+  uint8_t mac[6];
+  if (esp_read_mac(mac, ESP_MAC_EFUSE_FACTORY) != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to read base MAC for PTP port identity");
+    return ESP_FAIL;
+  }
+  ptp.local_port_identity[0] = mac[0] ^ 0x02;
+  ptp.local_port_identity[1] = mac[1];
+  ptp.local_port_identity[2] = mac[2];
+  ptp.local_port_identity[3] = 0xFF;
+  ptp.local_port_identity[4] = 0xFE;
+  memcpy(ptp.local_port_identity + 5, mac + 3, 3);
+  ptp.local_port_identity[8] = 0;
+  ptp.local_port_identity[9] = 1;
 
   // Create sockets
   ptp.event_socket = create_ptp_socket(PTP_EVENT_PORT);
@@ -680,6 +840,9 @@ static void clear_clock_state(void) {
 
   ptp.sync_count = 0;
   ptp.followup_count = 0;
+  ptp.master_addr_valid = false;
+  ptp.delay_req_pending = false;
+  ptp.pending_delay_req_clock_id = 0;
 
   // Drop the master filter so the next session can lock to whatever master
   // its anchor packet names (which may differ from the previous session).
@@ -802,6 +965,8 @@ void ptp_clock_set_master_clock_id(uint64_t clock_id) {
     ptp.awaiting_followup = false;
     ptp.sample_clock_id = 0;
     ptp.consecutive_outliers = 0;
+    ptp.delay_req_pending = false;
+    ptp.pending_delay_req_clock_id = 0;
   }
   portEXIT_CRITICAL(&ptp_state_mux);
 

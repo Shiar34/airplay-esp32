@@ -36,6 +36,13 @@ uint32_t mock_now_ms = 1000;
 static _Thread_local unsigned critical_depth;
 static void (*log_hook)(void);
 
+esp_err_t esp_read_mac(uint8_t *mac, esp_mac_type_t type) {
+  static const uint8_t test_mac[6] = {0x02, 0x11, 0x22, 0x33, 0x44, 0x55};
+  (void)type;
+  memcpy(mac, test_mac, sizeof(test_mac));
+  return ESP_OK;
+}
+
 void mock_enter_critical(portMUX_TYPE *mux) {
   if (pthread_mutex_lock(mux) != 0) {
     abort();
@@ -542,6 +549,106 @@ static void test_session_handover(void) {
   CHECK(ptp_clock_is_locked(), "other master between sessions: lock dropped");
 }
 
+static void test_delay_req_packet(void) {
+  printf("Delay_Req packet\n");
+  uint8_t packet[PTP_DELAY_REQ_SIZE] = {0};
+  const uint8_t port_identity[10] = {0x02, 0x11, 0x22, 0xFF, 0xFE,
+                                     0x33, 0x44, 0x55, 0, 1};
+  const int64_t timestamp_ns = 123456789012345LL;
+  size_t len = build_delay_req_packet(packet, sizeof(packet), 0x1234,
+                                      port_identity, timestamp_ns);
+  CHECK(len == PTP_DELAY_REQ_SIZE, "wrong Delay_Req length: %zu", len);
+  CHECK(packet[0] == 0x11 && packet[1] == 2 && packet[2] == 0 &&
+            packet[3] == PTP_DELAY_REQ_SIZE && packet[4] == 0,
+        "wrong Delay_Req header");
+  CHECK(packet[6] == 0x04 && packet[7] == 0x08,
+        "Delay_Req missing unicast/timescale flags");
+  CHECK(memcmp(packet + 20, port_identity, sizeof(port_identity)) == 0,
+        "Delay_Req has wrong source port identity");
+  CHECK(packet[30] == 0x12 && packet[31] == 0x34,
+        "Delay_Req has wrong sequence ID");
+  CHECK(parse_ptp_timestamp_ns(packet + PTP_TIMESTAMP_OFFSET) ==
+            (uint64_t)timestamp_ns,
+        "Delay_Req has wrong transmit timestamp");
+  CHECK(build_delay_req_packet(packet, PTP_DELAY_REQ_SIZE - 1, 0,
+                               port_identity, timestamp_ns) == 0,
+        "short buffer accepted");
+}
+
+static void make_delay_resp_packet(uint8_t *packet, uint64_t master,
+                                   uint16_t sequence_id,
+                                   const uint8_t requesting_port[10]) {
+  memset(packet, 0, PTP_DELAY_RESP_SIZE);
+  packet[0] = 0x10 | PTP_MSG_DELAY_RESP;
+  packet[1] = 2;
+  packet[3] = PTP_DELAY_RESP_SIZE;
+  for (int i = 0; i < 8; i++) {
+    packet[20 + i] = (uint8_t)(master >> (56 - 8 * i));
+  }
+  packet[28] = 0x80;
+  packet[29] = 0x05;
+  packet[30] = (uint8_t)(sequence_id >> 8);
+  packet[31] = (uint8_t)sequence_id;
+  memcpy(packet + PTP_HEADER_SIZE + PTP_TIMESTAMP_SIZE, requesting_port, 10);
+}
+
+static void test_delay_resp_matching(void) {
+  printf("Delay_Resp matching\n");
+  reset();
+  ptp.expected_clock_id = MASTER_A;
+  ptp.master_addr_clock_id = MASTER_A;
+  ptp.pending_delay_req_clock_id = MASTER_A;
+  ptp.master_addr_valid = true;
+  ptp.master_addr.sin_addr.s_addr = inet_addr("192.0.2.1");
+  ptp.delay_req_pending = true;
+  ptp.pending_delay_req_seq = 7;
+  for (size_t i = 0; i < sizeof(ptp.local_port_identity); i++) {
+    ptp.local_port_identity[i] = (uint8_t)(i + 1);
+  }
+
+  struct sockaddr_in source = {0};
+  source.sin_family = AF_INET;
+  source.sin_addr.s_addr = inet_addr("192.0.2.1");
+  source.sin_port = htons(PTP_GENERAL_PORT);
+  uint8_t response[PTP_DELAY_RESP_SIZE];
+  make_delay_resp_packet(response, MASTER_A, 7, ptp.local_port_identity);
+
+  response[PTP_HEADER_SIZE + PTP_TIMESTAMP_SIZE] ^= 0x01;
+  process_ptp_message_from(response, sizeof(response), false, &source);
+  CHECK(ptp.delay_req_pending && ptp.delay_resp_count == 0,
+        "response for another requester was accepted");
+
+  make_delay_resp_packet(response, MASTER_A, 8, ptp.local_port_identity);
+  process_ptp_message_from(response, sizeof(response), false, &source);
+  CHECK(ptp.delay_req_pending && ptp.delay_resp_count == 0,
+        "response with wrong sequence was accepted");
+
+  make_delay_resp_packet(response, MASTER_B, 7, ptp.local_port_identity);
+  process_ptp_message_from(response, sizeof(response), false, &source);
+  CHECK(ptp.delay_req_pending && ptp.delay_resp_count == 0,
+        "response from another master was accepted");
+
+  source.sin_addr.s_addr = inet_addr("192.0.2.2");
+  make_delay_resp_packet(response, MASTER_A, 7, ptp.local_port_identity);
+  process_ptp_message_from(response, sizeof(response), false, &source);
+  CHECK(ptp.delay_req_pending && ptp.delay_resp_count == 0,
+        "response from another address was accepted");
+
+  source.sin_addr.s_addr = inet_addr("192.0.2.1");
+  process_ptp_message_from(response, sizeof(response), false, &source);
+  CHECK(!ptp.delay_req_pending && ptp.delay_resp_count == 1,
+        "matching response was rejected");
+
+    ptp.expected_clock_id = 0;
+    ptp.delay_req_pending = true;
+    ptp.pending_delay_req_seq = 8;
+    ptp.pending_delay_req_clock_id = MASTER_A;
+    make_delay_resp_packet(response, MASTER_A, 8, ptp.local_port_identity);
+    process_ptp_message_from(response, sizeof(response), false, &source);
+    CHECK(!ptp.delay_req_pending && ptp.delay_resp_count == 2,
+      "pre-anchor clock probe response was rejected");
+}
+
 int main(void) {
   test_delayed_first_sample();
   test_delay_burst_ignored();
@@ -557,6 +664,8 @@ int main(void) {
   test_master_selection_log_yield();
   test_concurrent_packets_and_sessions();
   test_session_handover();
+  test_delay_req_packet();
+  test_delay_resp_matching();
   if (failures) {
     printf("%d check(s) failed\n", failures);
     return 1;

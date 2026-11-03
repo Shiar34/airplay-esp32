@@ -13,6 +13,11 @@ typedef int esp_err_t;
 #define ESP_FAIL              -1
 #define ESP_ERR_INVALID_STATE 0x103
 
+typedef enum {
+  ESP_MAC_EFUSE_FACTORY,
+} esp_mac_type_t;
+esp_err_t esp_read_mac(uint8_t *mac, esp_mac_type_t type);
+
 void mock_log(const char *tag, const char *format, ...);
 #define ESP_LOGE mock_log
 #define ESP_LOGW mock_log

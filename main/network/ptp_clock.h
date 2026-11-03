@@ -8,8 +8,9 @@
 #include "esp_err.h"
 
 /**
- * Simple PTP (IEEE 1588) slave for AirPlay time synchronization.
- * Listens for SYNC/FOLLOW_UP messages and tracks offset to PTP master.
+ * PTP (IEEE 1588) slave for AirPlay time synchronization.
+ * Tracks the master offset from SYNC/FOLLOW_UP and exchanges Delay_Req/
+ * Delay_Resp probes with the selected master.
  */
 
 /**
