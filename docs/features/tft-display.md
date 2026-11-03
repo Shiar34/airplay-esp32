@@ -58,6 +58,22 @@ The display is **disabled by default**.
     CONFIG_DISPLAY_BL_GPIO=38
     ```
 
+## Idle clock
+
+When playback is in standby, the TFT shows a fullscreen 24-hour `HH:MM` clock.
+Connected and paused sessions keep their existing playback display. Until the device
+gets its first time update, standby shows “AirPlay Ready” and “Time sync in progress.”
+
+Time is synchronized from the NTP server advertised by DHCP (Option 42) on Wi-Fi or
+Ethernet. The network must provide that option; there is no hard-coded public NTP
+fallback. After a successful sync, the clock keeps running if the network is lost.
+The ESP32 has no battery-backed clock here, so after a reboot without network time,
+the sync-in-progress message remains until DHCP provides time again.
+
+Set the timezone on the Speaker page at `/config`. Enter a POSIX TZ string; the default
+is `UTC0`. For example, US Pacific time with daylight saving is
+`PST8PDT,M3.2.0,M11.1.0`. IANA names such as `America/Los_Angeles` are not supported.
+
 ## Background image
 
 At startup the driver loads a full-screen background from `/spiffs/bg/background.bin` into

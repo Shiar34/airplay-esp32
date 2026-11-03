@@ -17,6 +17,7 @@
 #include "ptp_clock.h"
 #include "rtsp_server.h"
 #include "settings.h"
+#include "system_time.h"
 #include "web_server.h"
 #include "log_stream.h"
 #include "wifi.h"
@@ -52,7 +53,9 @@
 #endif
 
 #include "iot_board.h"
+#include "esp_event.h"
 #include "esp_heap_caps.h"
+#include "esp_netif.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
@@ -471,6 +474,17 @@ void app_main(void) {
   // display/LVGL port is ready.
   iot_board_init_lvgl_resources();
   log_dram("board+display");
+
+  // DHCP must see the SNTP client before either network interface starts.
+  err = esp_netif_init();
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+    ESP_ERROR_CHECK(err);
+  }
+  err = esp_event_loop_create_default();
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+    ESP_ERROR_CHECK(err);
+  }
+  ESP_ERROR_CHECK(system_time_init());
 
   // Try ethernet first
   bool eth_available = false;

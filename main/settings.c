@@ -9,7 +9,9 @@
 #include "nvs.h"
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static const char *TAG = "settings";
 
@@ -21,6 +23,7 @@ static const char *TAG = "settings";
 #define NVS_KEY_WIFI_SSID      "wifi_ssid"
 #define NVS_KEY_WIFI_PASSWORD  "wifi_pass"
 #define NVS_KEY_DEVICE_NAME    "device_name"
+#define NVS_KEY_TIMEZONE       "timezone"
 #define NVS_KEY_LED_BRIGHTNESS "led_bright"
 #define NVS_KEY_CHANNEL_MODE   "chan_mode"
 #define NVS_KEY_SUB_OFFSET     "sub_off"
@@ -43,6 +46,7 @@ static const char *TAG = "settings";
 #define MAX_WIFI_SSID_LEN     32
 #define MAX_WIFI_PASSWORD_LEN 64
 #define MAX_DEVICE_NAME_LEN   64
+#define DEFAULT_TIMEZONE      "UTC0"
 
 // Cached values. Only ever used on a board that has never stored a volume,
 // so err quiet: an amplified board at half scale is startlingly loud, and a
@@ -58,11 +62,40 @@ static bool g_bt_volume_loaded = false;
 
 static bool g_airplay_v1;
 static bool g_airplay_v1_configured;
+static char g_timezone[SETTINGS_TIMEZONE_MAX_LEN + 1] = DEFAULT_TIMEZONE;
 
 #ifdef CONFIG_SENDSPIN_ENABLE
 static bool g_sendspin_enabled;
 static bool g_sendspin_enabled_configured;
 #endif
+
+static bool timezone_input_is_safe(const char *timezone) {
+  if (!timezone) {
+    return false;
+  }
+
+  size_t len = strlen(timezone);
+  if (len == 0 || len > SETTINGS_TIMEZONE_MAX_LEN) {
+    return false;
+  }
+
+  for (size_t i = 0; i < len; i++) {
+    unsigned char ch = (unsigned char)timezone[i];
+    if (ch < 0x20 || ch > 0x7e) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static void apply_timezone(void) {
+  if (setenv("TZ", g_timezone, 1) == 0) {
+    tzset();
+  } else {
+    ESP_LOGE(TAG, "Could not apply timezone");
+  }
+}
 
 esp_err_t settings_init(void) {
   // Load volume on init
@@ -84,6 +117,15 @@ esp_err_t settings_init(void) {
                g_airplay_v1 ? "v1 (classic RAOP)" : "v2");
     }
 
+    size_t timezone_size = sizeof(g_timezone);
+    if (nvs_get_str(nvs, NVS_KEY_TIMEZONE, g_timezone, &timezone_size) ==
+            ESP_OK &&
+        timezone_input_is_safe(g_timezone)) {
+      ESP_LOGI(TAG, "Loaded timezone: %s", g_timezone);
+    } else {
+      strlcpy(g_timezone, DEFAULT_TIMEZONE, sizeof(g_timezone));
+    }
+
 #ifdef CONFIG_SENDSPIN_ENABLE
     uint8_t sendspin;
     if (nvs_get_u8(nvs, NVS_KEY_SENDSPIN, &sendspin) == ESP_OK) {
@@ -95,6 +137,8 @@ esp_err_t settings_init(void) {
 
     nvs_close(nvs);
   }
+
+  apply_timezone();
 
   g_airplay_v1_configured = g_airplay_v1;
 #ifdef CONFIG_SENDSPIN_ENABLE
@@ -352,6 +396,39 @@ esp_err_t settings_set_device_name(const char *name) {
     ESP_LOGE(TAG, "Failed to save device name: %s", esp_err_to_name(err));
   }
 
+  return err;
+}
+
+esp_err_t settings_get_timezone(char *timezone, size_t len) {
+  if (!timezone || len == 0) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  strlcpy(timezone, g_timezone, len);
+  return ESP_OK;
+}
+
+esp_err_t settings_set_timezone(const char *timezone) {
+  if (!timezone_input_is_safe(timezone)) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  nvs_handle_t nvs;
+  esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+  if (err != ESP_OK) {
+    return err;
+  }
+
+  err = nvs_set_str(nvs, NVS_KEY_TIMEZONE, timezone);
+  if (err == ESP_OK) {
+    err = nvs_commit(nvs);
+  }
+  nvs_close(nvs);
+
+  if (err == ESP_OK) {
+    strlcpy(g_timezone, timezone, sizeof(g_timezone));
+    apply_timezone();
+  }
   return err;
 }
 

@@ -102,6 +102,13 @@
 <div class='form-group'><label for='led'>Brightness</label>
 <div class='slider-row'><input type='range' id='led' min='0' max='255' value='128'><span id='led-pct'>50%</span></div></div>
 </div>
+<div class='card'><h2>Clock</h2>
+<div class='form-group'><label for='timezone'>Timezone</label>
+<div class='row'><input type='text' id='timezone' maxlength='63' placeholder='PST8PDT,M3.2.0,M11.1.0'>
+<button class='btn btn-primary' id='timezone-btn' onclick='saveTimezone()'>Save</button></div>
+<p class='hint'>POSIX TZ format. Use UTC0 for UTC.</p>
+<div id='timezone-msg' class='msg'></div></div>
+</div>
 </div></main>
 <script>
 var $=function(id){return document.getElementById(id);};
@@ -296,6 +303,23 @@ async function saveName(){
   catch(e){Shell.tick(b,false,e.message);}
 }
 $('dev-name').addEventListener('keydown',function(e){if(e.key==='Enter')saveName();});
+
+async function loadTimezone(){
+  try{var d=await Shell.get('/api/timezone');$('timezone').value=d.timezone||'UTC0';}
+  catch(e){console.warn('Could not load the timezone',e);}
+}
+async function saveTimezone(){
+  var input=$('timezone'),button=$('timezone-btn');
+  try{var d=await Shell.post('/api/timezone',{timezone:input.value.trim()});
+    if(!d.success)throw new Error(d.error);
+    Shell.tick(button,true);}
+  catch(e){Shell.tick(button,false,e.message);}
+}
+inputTimezoneKeydown();
+function inputTimezoneKeydown(){
+  $('timezone').addEventListener('keydown',function(e){if(e.key==='Enter')saveTimezone();});
+}
+loadTimezone();
 
 async function saveAirplayMode(){
   var sel=$('airplay-mode'),v1=sel.value==='1';

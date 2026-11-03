@@ -666,6 +666,55 @@ static bool json_int_in_range(const cJSON *v, int lo, int hi) {
          v->valueint >= lo && v->valueint <= hi;
 }
 
+static esp_err_t timezone_get_handler(httpd_req_t *req) {
+  char timezone[SETTINGS_TIMEZONE_MAX_LEN + 1];
+  settings_get_timezone(timezone, sizeof(timezone));
+
+  cJSON *json = cJSON_CreateObject();
+  cJSON_AddStringToObject(json, "timezone", timezone);
+  cJSON_AddBoolToObject(json, "success", true);
+  char *json_str = cJSON_Print(json);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+  free(json_str);
+  cJSON_Delete(json);
+  return ESP_OK;
+}
+
+static esp_err_t timezone_post_handler(httpd_req_t *req) {
+  char *content = recv_body(req, 256);
+  if (!content) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid request body");
+    return ESP_FAIL;
+  }
+
+  cJSON *json = cJSON_Parse(content);
+  free(content);
+  if (!json) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+    return ESP_FAIL;
+  }
+
+  const cJSON *value = cJSON_GetObjectItemCaseSensitive(json, "timezone");
+  cJSON *response = cJSON_CreateObject();
+  if (cJSON_IsString(value) && value->valuestring &&
+      settings_set_timezone(value->valuestring) == ESP_OK) {
+    cJSON_AddBoolToObject(response, "success", true);
+  } else {
+    cJSON_AddBoolToObject(response, "success", false);
+    cJSON_AddStringToObject(response, "error",
+                            "Expected 1-63 printable ASCII characters");
+  }
+
+  char *json_str = cJSON_Print(response);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+  free(json_str);
+  cJSON_Delete(json);
+  cJSON_Delete(response);
+  return ESP_OK;
+}
+
 static esp_err_t channel_mode_get_handler(httpd_req_t *req) {
   cJSON *json = cJSON_CreateObject();
   cJSON_AddNumberToObject(json, "mode", audio_output_get_channel_mode());
@@ -3343,6 +3392,16 @@ esp_err_t web_server_start(uint16_t port) {
                                  .method = HTTP_POST,
                                  .handler = device_name_handler};
   register_uri(&device_name_uri);
+
+  httpd_uri_t timezone_get_uri = {.uri = "/api/timezone",
+                                  .method = HTTP_GET,
+                                  .handler = timezone_get_handler};
+  register_uri(&timezone_get_uri);
+
+  httpd_uri_t timezone_post_uri = {.uri = "/api/timezone",
+                                   .method = HTTP_POST,
+                                   .handler = timezone_post_handler};
+  register_uri(&timezone_post_uri);
 
   httpd_uri_t led_brightness_get_uri = {.uri = "/api/led/brightness",
                                         .method = HTTP_GET,

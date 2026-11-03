@@ -36,6 +36,7 @@ set( SRC_FILES
     "hap/srp.c"
     "hap/tlv8.c"
     "network/wifi.c"
+    "network/system_time.c"
     "network/mdns_airplay.c"
     "network/ptp_clock.c"
     "network/ntp_clock.c"

@@ -12,6 +12,7 @@
 
 // Default device name (used if none configured)
 #define SETTINGS_DEFAULT_DEVICE_NAME "ESP32 AirPlay"
+#define SETTINGS_TIMEZONE_MAX_LEN 63
 
 /**
  * Initialize settings module (call once at startup)
@@ -104,6 +105,12 @@ esp_err_t settings_get_device_name(char *name, size_t len);
  * @param name Device name
  */
 esp_err_t settings_set_device_name(const char *name);
+
+/** Get the saved POSIX timezone (defaulting to UTC0). */
+esp_err_t settings_get_timezone(char *timezone, size_t len);
+
+/** Validate, apply, and persist a POSIX timezone string. */
+esp_err_t settings_set_timezone(const char *timezone);
 
 /**
  * Derive a DNS/DHCP-safe hostname from a device name.

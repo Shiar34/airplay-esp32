@@ -34,6 +34,7 @@ CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC=y
 
 # LWIP - increase socket limits for AirPlay
 CONFIG_LWIP_MAX_SOCKETS=16
+CONFIG_LWIP_DHCP_GET_NTP_SRV=y
 
 # Enable SO_RCVBUF so the buffered-audio socket can use a small receive
 # buffer.  We do our own jitter buffering in audio_buffer; the kernel
