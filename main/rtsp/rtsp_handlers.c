@@ -1491,6 +1491,7 @@ static void format_time_mmss(uint32_t seconds, char *out, size_t out_size) {
  *   asal = album
  *   asgn = genre
  *   asai = album id (64-bit)
+ *   astm = track duration (milliseconds)
  */
 #define DMAP_MAX_NESTING 8
 
@@ -1549,6 +1550,15 @@ static void parse_dmap_metadata(const uint8_t *data, size_t len,
       memcpy(meta->genre, data + pos, copy_len);
       meta->genre[copy_len] = '\0';
       ESP_LOGI(TAG, "  Genre  = %s", meta->genre);
+    } else if (strcmp(tag, "astm") == 0 && item_len == 4) {
+      uint32_t duration_ms = ((uint32_t)data[pos] << 24) |
+                             ((uint32_t)data[pos + 1] << 16) |
+                             ((uint32_t)data[pos + 2] << 8) | data[pos + 3];
+      meta->duration_secs = duration_ms / 1000;
+      char duration_str[16];
+      format_time_mmss(meta->duration_secs, duration_str,
+                       sizeof(duration_str));
+      ESP_LOGI(TAG, "  Duration = %s", duration_str);
     } else if (strcmp(tag, "mlit") == 0 || strcmp(tag, "cmst") == 0 ||
                strcmp(tag, "mdst") == 0) {
       // Container tags - recurse into them
@@ -1702,13 +1712,22 @@ static void handle_set_parameter(int socket, rtsp_conn_t *conn,
       }
       // Progress info from bplist
       double elapsed = 0, duration = 0;
-      if (bplist_find_real(body, body_len, "elapsed", &elapsed)) {
+      bool has_elapsed = bplist_find_real(body, body_len, "elapsed", &elapsed);
+      bool has_duration =
+          bplist_find_real(body, body_len, "duration", &duration);
+      if (has_elapsed) {
         event_data.metadata.position_secs = (uint32_t)elapsed;
         has_metadata = true;
+      }
+      if (has_duration) {
+        event_data.metadata.duration_secs = (uint32_t)duration;
+        has_metadata = true;
+      }
+
+      if (has_elapsed) {
         char elapsed_str[16];
         format_time_mmss((uint32_t)elapsed, elapsed_str, sizeof(elapsed_str));
-        if (bplist_find_real(body, body_len, "duration", &duration)) {
-          event_data.metadata.duration_secs = (uint32_t)duration;
+        if (has_duration) {
           char duration_str[16];
           format_time_mmss((uint32_t)duration, duration_str,
                            sizeof(duration_str));
@@ -1716,6 +1735,11 @@ static void handle_set_parameter(int socket, rtsp_conn_t *conn,
         } else {
           ESP_LOGI(TAG, "Progress: %s", elapsed_str);
         }
+      } else if (has_duration) {
+        char duration_str[16];
+        format_time_mmss((uint32_t)duration, duration_str,
+                         sizeof(duration_str));
+        ESP_LOGI(TAG, "Progress duration: %s", duration_str);
       }
     }
   }

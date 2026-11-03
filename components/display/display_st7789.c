@@ -27,6 +27,7 @@
 #include "board_common.h"
 #include "playback_control.h"
 #include "playback_events.h"
+#include "network/system_time.h"
 
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
@@ -45,6 +46,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 static const char *TAG = "display_st7789";
 
@@ -138,6 +140,8 @@ static lv_obj_t *s_label_time_elapsed = NULL;
 static lv_obj_t *s_label_time_remaining = NULL;
 static lv_obj_t *s_label_battery = NULL;
 static lv_obj_t *s_label_volume = NULL;
+static lv_obj_t *s_label_clock = NULL;
+static bool s_clock_mode = false;
 
 typedef struct {
   const uint8_t *input;
@@ -495,6 +499,47 @@ static void ui_create(void) {
   lv_obj_set_style_text_color(s_label_battery, lv_color_make(150, 150, 150), 0);
   lv_obj_align(s_label_battery, LV_ALIGN_TOP_RIGHT, X_MARGIN_R, Y_STATUS);
   lv_label_set_text(s_label_battery, "");
+
+  s_label_clock = lv_label_create(scr);
+#ifdef CONFIG_LV_FONT_MONTSERRAT_48
+  lv_obj_set_style_text_font(s_label_clock, &lv_font_montserrat_48, 0);
+  int32_t clock_scale = (DISPLAY_WIDTH >= 300) ? 512 : 384;
+#else
+  lv_obj_set_style_text_font(s_label_clock, &lv_font_montserrat_24, 0);
+  int32_t clock_scale = (DISPLAY_WIDTH >= 300) ? 1024 : 768;
+#endif
+  lv_obj_set_style_text_color(s_label_clock, lv_color_white(), 0);
+  lv_label_set_text(s_label_clock, "00:00");
+  lv_obj_update_layout(s_label_clock);
+  lv_obj_set_style_transform_pivot_x(s_label_clock,
+                                     lv_obj_get_width(s_label_clock) / 2, 0);
+  lv_obj_set_style_transform_pivot_y(s_label_clock,
+                                     lv_obj_get_height(s_label_clock) / 2, 0);
+  lv_obj_set_style_transform_scale(s_label_clock, clock_scale, 0);
+  lv_obj_align(s_label_clock, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_set_hidden(s_label_clock, true);
+}
+
+static void ui_set_clock_mode(bool enabled) {
+  bool mode_changed = s_clock_mode != enabled;
+  s_clock_mode = enabled;
+
+  lv_obj_set_hidden(s_label_clock, !enabled);
+  lv_obj_set_hidden(s_label_title, enabled);
+  lv_obj_set_hidden(s_label_artist, enabled);
+  lv_obj_set_hidden(s_label_album, enabled);
+  lv_obj_set_hidden(s_label_status, enabled);
+  lv_obj_set_hidden(s_image_artwork, enabled || !s_artwork_buf);
+  lv_obj_set_hidden(s_label_muted, enabled || !playback_control_is_muted());
+  lv_obj_set_hidden(s_bar_progress, enabled);
+  lv_obj_set_hidden(s_label_time_elapsed, enabled);
+  lv_obj_set_hidden(s_label_time_remaining, enabled);
+  lv_obj_set_hidden(s_label_volume, enabled);
+  lv_obj_set_hidden(s_label_battery, enabled);
+
+  if (mode_changed) {
+    lv_obj_invalidate(lv_screen_active());
+  }
 }
 
 // Update the battery + volume status row. Called from ui_update() with the
@@ -636,10 +681,25 @@ static void ui_update(void) {
   lv_obj_set_width(s_label_artist, text_width);
   lv_obj_set_width(s_label_album, text_width - 40);
 
+  bool show_clock = state == DISPLAY_STATE_STANDBY &&
+                    system_time_is_synced();
+  ui_set_clock_mode(show_clock);
+
   switch (state) {
   case DISPLAY_STATE_STANDBY:
+    if (show_clock) {
+      time_t now;
+      struct tm local_time;
+      char clock_text[6] = "--:--";
+      time(&now);
+      if (localtime_r(&now, &local_time)) {
+        strftime(clock_text, sizeof(clock_text), "%H:%M", &local_time);
+      }
+      lv_label_set_text(s_label_clock, clock_text);
+      break;
+    }
     lv_label_set_text(s_label_title, "AirPlay Ready");
-    lv_label_set_text(s_label_artist, "");
+    lv_label_set_text(s_label_artist, "Time sync in progress");
     lv_label_set_text(s_label_album, "");
     lv_label_set_text(s_label_status, "");
     lv_label_set_text(s_label_time_elapsed, "");
@@ -880,11 +940,22 @@ static void display_task(void *pvParameters) {
       ui_update();
     }
 
+    static TickType_t last_clock_update = 0;
+    if (state == DISPLAY_STATE_STANDBY && system_time_is_synced() &&
+        (now - last_clock_update) >= pdMS_TO_TICKS(1000)) {
+      last_clock_update = now;
+      if (!need_update) {
+        ui_update();
+      }
+    }
+
     // Refresh battery + volume + channel mode periodically even when idle.
     // These are not tied to RTSP events; poll at 1s so an interactive change
     // (volume, double-click channel toggle) shows up promptly.
     static TickType_t last_status_update = 0;
-    if (!need_update && (now - last_status_update) >= pdMS_TO_TICKS(1000)) {
+    if (!need_update &&
+      !(state == DISPLAY_STATE_STANDBY && system_time_is_synced()) &&
+      (now - last_status_update) >= pdMS_TO_TICKS(1000)) {
       last_status_update = now;
       if (lvgl_port_lock(100)) {
         ui_update_status_row();
